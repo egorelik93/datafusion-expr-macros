@@ -1,9 +1,11 @@
 extern crate proc_macro;
 
+use std::iter::Iterator;
+
 use proc_macro::TokenStream;
 use quote::{quote, ToTokens};
 use syn::{
-    parse_macro_input, parse_quote, BinOp, Expr, ExprBinary, ExprClosure, ExprField, ExprPath, Ident, Lit, LitBool, Member, Pat, PathArguments, ReturnType
+    parse_macro_input, parse_quote, BinOp, Expr, ExprBinary, ExprClosure, ExprField, ExprPath, Ident, Lit, LitBool, Member, Pat, PathArguments, ReturnType, UnOp
 };
 
 static QUERY_EXPR_NAME: &'static str = "query_expr";
@@ -54,51 +56,199 @@ pub fn query_expr(input: TokenStream) -> TokenStream {
     }
 
     let row_arg = args.first().unwrap();
-    let row_arg = match row_arg {
-        Pat::Ident(ident) => ident,
-        _ => panic!(
-            "{} does not support patterns in the argument",
-            QUERY_EXPR_NAME
-        ),
-    };
+    let row_arg = get_ident_from_pattern(&row_arg);
 
-    if row_arg.attrs.len() != 0 {
-        panic_attributes();
-    }
-
-    if row_arg.by_ref.is_some() {
-        panic!("{} does not support ref specifiers", QUERY_EXPR_NAME);
-    }
-
-    if row_arg.mutability.is_some() {
-        panic!("{} does not support mut specifiers", QUERY_EXPR_NAME);
-    }
-
-    if row_arg.subpat.is_some() {
-        panic!("{} does not support subpatters", QUERY_EXPR_NAME);
-    }
-
-    let row_arg = &row_arg.ident;
-    let translator = RowExprTranslator { row_arg: &row_arg };
+    let mut translator = RowExprTranslator { row_arg: &row_arg, context: vec!() };
 
     translator.translate_expr(&input.body).into_token_stream().into()
 }
 
+fn get_ident_from_pattern(pat: &Pat) -> &Ident {
+    let pat = match pat {
+        Pat::Ident(ident) => ident,
+        _ => panic!("{} does not support patterns", QUERY_EXPR_NAME)
+    };
+
+    if pat.by_ref.is_some() {
+        panic!("{} does not support ref specifiers", QUERY_EXPR_NAME);
+    }
+
+    if pat.mutability.is_some() {
+        panic!("{} does not support mut specifiers", QUERY_EXPR_NAME);
+    }
+
+    if pat.subpat.is_some() {
+        panic!("{} does not support subpatters", QUERY_EXPR_NAME);
+    }
+
+    &pat.ident
+}
+
 struct RowExprTranslator<'a> {
     row_arg: &'a Ident,
+    context: Vec<Vec<(Ident, Expr)>>
 }
 
 impl RowExprTranslator<'_> {
-    fn translate_expr(&self, expr: &Expr) -> Expr {
+    fn translate_block(&mut self, block: &syn::Block) -> Expr {
+        self.context.push(vec!());
+
+        let mut expr = None;
+        for stmt in &block.stmts {
+            if let Some(_) = expr {
+                panic!("More than one expression cannot be returned from a block");
+            }
+
+            expr = self.translate_stmt(&stmt)
+        }
+
+        self.context.pop();
+        expr.expect("No expression was returned from the block")
+    }
+
+    fn translate_stmt(&mut self, stmt: &syn::Stmt) -> Option<Expr> {
+        match stmt {
+            syn::Stmt::Local(local) =>   {
+                self.translate_let(local);
+                None
+            },
+            syn::Stmt::Macro(_) => panic!("Macros are not allowed"),
+            syn::Stmt::Expr(e, semicolon) => {
+                if semicolon.is_some() {
+                    panic!("Statement expressions are not allowed");
+                }
+
+                Some(self.translate_expr(e))
+            },
+            syn::Stmt::Item(item) => {
+                match item {
+                    syn::Item::Const(item) => {
+                        if item.attrs.len() != 0 {
+                            panic_attributes();
+                        }
+
+                        if let syn::Visibility::Inherited = item.vis {}
+                        else { panic!("Visibility specifiers not allowed") }
+
+                        if !item.generics.params.is_empty() || item.generics.where_clause.is_some() {
+                            panic!("Generics not allowed");
+                        }
+
+                        let mut fresh_translator = RowExprTranslator {
+                            row_arg: self.row_arg,
+                            context: vec!(vec!())
+                        };
+
+                        fresh_translator.translate_let(&syn::Local {
+                            attrs: vec!(),
+                            let_token: Default::default(),
+                            pat: Pat::Ident(syn::PatIdent {
+                                attrs: vec!(),
+                                by_ref: None,
+                                mutability: None,
+                                ident: item.ident.clone(),
+                                subpat: None }),
+                            init: Some(syn::LocalInit {
+                                eq_token: Default::default(),
+                                expr: item.expr.clone(),
+                                diverge: None }),
+                            semi_token: item.semi_token
+                        });
+
+                        let last_ctx = self.context.last_mut().unwrap();
+                        last_ctx.append(fresh_translator.context.last_mut().unwrap());
+                    },
+                    _ => panic!("Statement item was not allowed")
+                }
+
+                None
+            }
+        }
+    }
+
+    fn translate_let(&mut self, local: &syn::Local) {
+        if local.attrs.len() != 0 {
+            panic_attributes();
+        }
+
+        let ident = get_ident_from_pattern(&local.pat);
+
+        if ident == self.row_arg {
+            panic!("Do not shadow row argument");
+        }
+
+        let body = local.init.as_ref().expect("Uninitialized let statements are not allowed");
+        if body.diverge.is_some() {
+            panic!("let-else statements are not allowed");
+        }
+
+        let body = self.translate_expr(&body.expr);
+
+        let last_ctx = self.context.last_mut().unwrap();
+        last_ctx.push((ident.clone(), body));
+    }
+
+    fn translate_expr(&mut self, expr: &Expr) -> Expr {
         match expr {
             Expr::Lit(lit) => self.translate_literal(&lit),
             Expr::Field(field) => self.translate_field(&field),
+            Expr::Unary(unary) => self.translate_unary_expr(&unary),
             Expr::Binary(binary) => self.translate_binary_expr(&binary),
+            Expr::Path(path) => self.translate_path(&path),
+            Expr::Paren(paren) => {
+                if paren.attrs.len() != 0 {
+                    panic_attributes();
+                }
+
+                let expr = self.translate_expr(&paren.expr);
+                parse_quote! { (#expr) }
+            },
+            Expr::Group(group) => {
+                if group.attrs.len() != 0 {
+                    panic_attributes();
+                }
+
+                let expr = self.translate_expr(&group.expr);
+                parse_quote! { (#expr) }
+            }
+            Expr::Block(block) => {
+                if block.attrs.len() != 0 {
+                    panic_attributes();
+                }
+
+                if block.label.is_some() {
+                    panic!("Labels are not supported");
+                }
+
+                self.translate_block(&block.block)
+            },
             _ => panic!("Unsupported expr"),
         }
     }
 
-    fn translate_field(&self, field: &ExprField) -> Expr {
+    fn translate_path(&mut self, path: &syn::ExprPath) -> Expr {
+        if path.attrs.len() != 0 {
+            panic_attributes();
+        }
+
+        if path.qself.is_some() {
+            panic!("self is not allowed here");
+        }
+
+        let ident = path.path.get_ident().expect("Only variable names are allowed here");
+
+        for ctx in self.context.iter().rev() {
+            for pair in ctx.iter().rev() {
+                if &pair.0 == ident {
+                    return pair.1.clone();
+                }
+            }
+        }
+
+        panic!("Variable {} was not found", &ident);
+    }
+
+    fn translate_field(&mut self, field: &ExprField) -> Expr {
         if field.attrs.len() != 0 {
             panic!("{} does not support attributes", QUERY_EXPR_NAME);
         }
@@ -129,7 +279,21 @@ impl RowExprTranslator<'_> {
     }
     */
 
-    fn translate_binary_expr(&self, binary: &syn::ExprBinary) -> Expr {
+    fn translate_unary_expr(&mut self, unary: &syn::ExprUnary) -> Expr {
+        if unary.attrs.len() != 0 {
+            panic_attributes();
+        }
+
+        let expr = self.translate_expr(&unary.expr);
+
+        match unary.op {
+            UnOp::Neg(_) => parse_quote! { -(#expr) },
+            UnOp::Not(_) => parse_quote! { !(#expr) },
+            _ => panic!("Operator '{}' is not supported", unary.op.to_token_stream())
+        }
+    }
+
+    fn translate_binary_expr(&mut self, binary: &syn::ExprBinary) -> Expr {
         if binary.attrs.len() != 0 {
             panic_attributes();
         }
@@ -165,7 +329,7 @@ impl RowExprTranslator<'_> {
         return expr;
     }
 
-    fn translate_binary_cmp_expr(&self, binary: &syn::ExprBinary) -> Expr {
+    fn translate_binary_cmp_expr(&mut self, binary: &syn::ExprBinary) -> Expr {
         match (&*binary.left, &binary.op, &*binary.right) {
             (Expr::Lit(syn::ExprLit { attrs: attrs_l, lit: Lit::Bool(syn::LitBool { value: left_b, .. }) }),
             BinOp::Eq(_) | BinOp::Ne(_),
@@ -264,7 +428,7 @@ impl RowExprTranslator<'_> {
         }
     }
 
-    fn translate_literal(&self, lit: &syn::ExprLit) -> Expr {
+    fn translate_literal(&mut self, lit: &syn::ExprLit) -> Expr {
         if lit.attrs.len() != 0 {
             panic_attributes();
         }
