@@ -1,11 +1,11 @@
 extern crate proc_macro;
 
-use std::iter::Iterator;
+use std::{iter::Iterator, rc::Rc};
 
 use proc_macro::TokenStream;
 use quote::{quote, ToTokens};
 use syn::{
-    parse_macro_input, parse_quote, BinOp, Expr, ExprBinary, ExprClosure, ExprField, ExprPath, Ident, Lit, LitBool, Member, Pat, PathArguments, ReturnType, UnOp
+    parse_macro_input, parse_quote, BinOp, Expr, ExprBinary, ExprClosure, ExprField, ExprPath, Ident, Lit, LitBool, Member, Pat, Path, PathArguments, ReturnType, UnOp
 };
 
 static QUERY_EXPR_NAME: &'static str = "query_expr";
@@ -58,7 +58,7 @@ pub fn query_expr(input: TokenStream) -> TokenStream {
     let row_arg = args.first().unwrap();
     let row_arg = get_ident_from_pattern(&row_arg);
 
-    let mut translator = RowExprTranslator { row_arg: &row_arg, context: vec!() };
+    let mut translator = Translator { row_arg: Some(&row_arg), context: vec!() };
 
     translator.translate_expr(&input.body).into_token_stream().into()
 }
@@ -84,12 +84,12 @@ fn get_ident_from_pattern(pat: &Pat) -> &Ident {
     &pat.ident
 }
 
-struct RowExprTranslator<'a> {
-    row_arg: &'a Ident,
-    context: Vec<Vec<(Ident, Expr)>>
+struct Translator<'a> {
+    row_arg: Option<&'a Ident>,
+    context: Vec<Vec<(Ident, LetValue)>>
 }
 
-impl RowExprTranslator<'_> {
+impl Translator<'_> {
     fn translate_block(&mut self, block: &syn::Block) -> Expr {
         self.context.push(vec!());
 
@@ -134,8 +134,8 @@ impl RowExprTranslator<'_> {
                             panic!("Generics not allowed");
                         }
 
-                        let mut fresh_translator = RowExprTranslator {
-                            row_arg: self.row_arg,
+                        let mut fresh_translator = Translator {
+                            row_arg: None,
                             context: vec!(vec!())
                         };
 
@@ -173,7 +173,7 @@ impl RowExprTranslator<'_> {
 
         let ident = get_ident_from_pattern(&local.pat);
 
-        if ident == self.row_arg {
+        if Some(ident) == self.row_arg {
             panic!("Do not shadow row argument");
         }
 
@@ -185,7 +185,7 @@ impl RowExprTranslator<'_> {
         let body = self.translate_expr(&body.expr);
 
         let last_ctx = self.context.last_mut().unwrap();
-        last_ctx.push((ident.clone(), body));
+        last_ctx.push((ident.clone(), LetValue::Value(body)));
     }
 
     fn translate_expr(&mut self, expr: &Expr) -> Expr {
@@ -194,7 +194,8 @@ impl RowExprTranslator<'_> {
             Expr::Field(field) => self.translate_field(&field),
             Expr::Unary(unary) => self.translate_unary_expr(&unary),
             Expr::Binary(binary) => self.translate_binary_expr(&binary),
-            Expr::Path(path) => self.translate_path(&path),
+            Expr::Path(path) => self.translate_path_expr(&path),
+            Expr::Call(call) => self.translate_call(&call),
             Expr::Paren(paren) => {
                 if paren.attrs.len() != 0 {
                     panic_attributes();
@@ -222,11 +223,57 @@ impl RowExprTranslator<'_> {
 
                 self.translate_block(&block.block)
             },
-            _ => panic!("Unsupported expr"),
+            _ => panic!("Unsupported expr {}", expr.to_token_stream()),
         }
     }
 
-    fn translate_path(&mut self, path: &syn::ExprPath) -> Expr {
+    fn translate_call(&mut self, call: &syn::ExprCall) -> Expr {
+        if call.attrs.len() != 0 {
+            panic_attributes();
+        }
+
+        let func = match &*call.func {
+            Expr::Path(path) =>  self.translate_path_fn(path),
+            _ => panic!("A function was expected here")
+        };
+
+        let args: Vec<Expr> = call.args.iter().map(|e| self.translate_expr(e)).collect();
+        func(&args)
+    }
+
+    fn translate_path_expr(&mut self, path: &syn::ExprPath) -> Expr {
+        let value = self.translate_path(path);
+        let Some(value) = value
+        else {
+            if path.path.get_ident().is_none() { panic!("Only variable names are allowed here") }
+            else { panic!("Variable {} was not found", path.to_token_stream()) }
+        };
+
+        let LetValue::Value(expr) = value
+        else { panic!("A function was not expected here") };
+
+        expr
+    }
+
+    fn translate_path_fn(&mut self, path: &syn::ExprPath) -> Rc<dyn Fn(&[Expr]) -> Expr> {
+        let value = self.translate_path(path);
+        let path = match value {
+            Some(LetValue::Value(_)) => panic!("A function was expected here"),
+            Some(LetValue::Fn(f)) => return f,
+            None => path.path.clone()
+        };
+
+        Rc::new(move |args: &[Expr]| {
+            let n = args.len();
+            let path = &path;
+
+            parse_quote! { ::datafusion_expr_macros::ExprFn::<#n>::call_for_expr(
+                &(::datafusion_expr_macros::ExprFnDispatcher::new(#path)),
+                &[#(#args),*]) }
+        })
+    }
+
+    fn translate_path(&mut self, path: &syn::ExprPath) -> Option<LetValue> {
         if path.attrs.len() != 0 {
             panic_attributes();
         }
@@ -235,17 +282,18 @@ impl RowExprTranslator<'_> {
             panic!("self is not allowed here");
         }
 
-        let ident = path.path.get_ident().expect("Only variable names are allowed here");
+        let Some(ident) = path.path.get_ident()
+        else { return None };
 
         for ctx in self.context.iter().rev() {
             for pair in ctx.iter().rev() {
                 if &pair.0 == ident {
-                    return pair.1.clone();
+                    return Some(pair.1.clone());
                 }
             }
         }
 
-        panic!("Variable {} was not found", &ident);
+        None
     }
 
     fn translate_field(&mut self, field: &ExprField) -> Expr {
@@ -415,16 +463,16 @@ impl RowExprTranslator<'_> {
         }
 
         if path.qself.is_some() {
-            panic!("Expected the row variable {}", self.row_arg);
+            panic!("Expected the row variable {}", self.row_arg.unwrap());
         }
 
         let ident = match path.path.require_ident() {
             Ok(i) => i,
-            _ => panic!("Expected the row variable {}", self.row_arg),
+            _ => panic!("Expected the row variable {}", self.row_arg.unwrap()),
         };
 
-        if ident != self.row_arg {
-            panic!("Expected the row variable {}", self.row_arg);
+        if Some(ident) != self.row_arg {
+            panic!("Expected the row variable {}", self.row_arg.unwrap());
         }
     }
 
@@ -447,4 +495,11 @@ impl RowExprTranslator<'_> {
             _ => false
         }
     }
+}
+
+
+#[derive(Clone)]
+enum LetValue {
+    Value(Expr),
+    Fn(Rc<dyn Fn(&[Expr]) -> Expr>)
 }

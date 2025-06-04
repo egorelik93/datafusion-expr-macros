@@ -1,0 +1,11 @@
+[package]
+name = "datafusion-expr-macros"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+datafusion-expr = "*"
+datafusion-expr-macros-proc = { path = "../datafusion-expr-macros-proc" }
+
+[dev-dependencies]
+datafusion = "*"
