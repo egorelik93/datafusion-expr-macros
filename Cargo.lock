@@ -954,7 +954,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "datafusion-expr-macros"
+name = "datafusion-expr-macros-proc"
 version = "0.1.0"
 dependencies = [
  "datafusion",
