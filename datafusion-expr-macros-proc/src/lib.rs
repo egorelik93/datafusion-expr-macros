@@ -14,6 +14,41 @@ fn panic_attributes() -> ! {
     panic!("{} does not support attributes", QUERY_EXPR_NAME)
 }
 
+#[proc_macro_attribute]
+pub fn query_fn(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let mut input = parse_macro_input!(item as syn::ItemFn);
+
+    if input.sig.variadic.is_some() {
+        panic!("Variadics are not allowed");
+    }
+
+    let mut translator = Translator {
+        row_arg: None,
+        context: vec![]
+    };
+
+    let block = translator.translate_block(&input.block);
+
+    let fnargs = input.sig.inputs.iter().map(|a| {
+        let syn::FnArg::Typed(pat) = a
+        else { panic!("self arguments are not allowed here") };
+
+        let mut pat = pat.clone();
+        pat.ty = Box::new( parse_quote! { ::datafusion_expr::Expr } );
+
+        syn::FnArg::Typed(pat)
+    }).collect();
+
+    input.sig.inputs = fnargs;
+    input.sig.output = syn::ReturnType::Type(Default::default(), Box::new(parse_quote! { ::datafusion_expr::Expr }));
+
+    input.block = Box::new(parse_quote! {
+        { #block }
+    });
+
+    input.into_token_stream().into()
+}
+
 #[proc_macro]
 pub fn query_expr(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as ExprClosure);
@@ -244,9 +279,12 @@ impl Translator<'_> {
     fn translate_path_expr(&mut self, path: &syn::ExprPath) -> Expr {
         let value = self.translate_path(path);
         let Some(value) = value
-        else {
-            if path.path.get_ident().is_none() { panic!("Only variable names are allowed here") }
-            else { panic!("Variable {} was not found", path.to_token_stream()) }
+        else  {
+            if path.path.get_ident().is_none() {
+                panic!("Only variable names are allowed here");
+            }
+
+            return parse_quote! { (#path) };
         };
 
         let LetValue::Value(expr) = value

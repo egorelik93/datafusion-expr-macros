@@ -1,5 +1,5 @@
 use datafusion;
-use datafusion_expr_macros::query_expr;
+use datafusion_expr_macros::{query_expr, query_fn};
 
 #[test]
 fn fn_call() {
@@ -10,5 +10,19 @@ fn fn_call() {
 
     let e = query_expr!(|r|
       greatest(g(f(r.a, r.c))));
-    println!("{}", e.human_display());
+    assert_eq!(format!("{}", e.human_display()), "greatest(least(nullif(a, c)))");
+}
+
+use datafusion::functions::core::nullif;
+
+#[query_fn]
+fn example_query_fn(i: i32, j: i32) -> i32 {
+    nullif(i + j, true)
+}
+
+#[test]
+fn test_query_fn() {
+    let e = query_expr!(|r|
+        example_query_fn(r.a, r.b));
+    assert_eq!(format!("{}", e.human_display()), "nullif(a + b, Boolean(true))");
 }

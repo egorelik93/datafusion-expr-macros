@@ -4,7 +4,7 @@ use std::{marker::PhantomData};
 use std::sync::Arc;
 
 use datafusion_expr::{expr, AggregateUDF, Expr, ScalarUDF, WindowUDF};
-pub use datafusion_expr_macros_proc::query_expr;
+pub use datafusion_expr_macros_proc::{query_expr, query_fn};
 
 pub struct ExprFnDispatcher<F, Arity: ?Sized = F> {
     f: F,
